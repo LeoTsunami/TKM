@@ -1,0 +1,13 @@
+TheKeyMachine/__pycache__/__init__.cpython-37.pyc
+TheKeyMachine/core/__pycache__/customGraph.cpython-37.pyc
+TheKeyMachine/core/__pycache__/toolbar.cpython-37.pyc
+TheKeyMachine/mods/__pycache__/barMod.cpython-37.pyc
+TheKeyMachine/mods/__pycache__/generalMod.cpython-37.pyc
+TheKeyMachine/mods/__pycache__/helperMod.cpython-37.pyc
+TheKeyMachine/mods/__pycache__/hotkeysMod.cpython-37.pyc
+TheKeyMachine/mods/__pycache__/keyToolsMod.cpython-37.pyc
+TheKeyMachine/mods/__pycache__/mediaMod.cpython-37.pyc
+TheKeyMachine/mods/__pycache__/selSetsMod.cpython-37.pyc
+TheKeyMachine/mods/__pycache__/styleMod.cpython-37.pyc
+TheKeyMachine/mods/__pycache__/uiMod.cpython-37.pyc
+*.pyc
