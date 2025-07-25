@@ -11,3 +11,4 @@ TheKeyMachine/mods/__pycache__/selSetsMod.cpython-37.pyc
 TheKeyMachine/mods/__pycache__/styleMod.cpython-37.pyc
 TheKeyMachine/mods/__pycache__/uiMod.cpython-37.pyc
 *.pyc
+TheKeyMachine/data/config/config.json
