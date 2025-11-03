@@ -25,11 +25,17 @@ import maya.utils as utils
 import maya.OpenMaya as om
 import maya.OpenMayaUI as mui
 
-# Qt related imports
-from shiboken2 import wrapInstance
-from PySide2 import QtWidgets, QtCore, QtGui
-from PySide2.QtWidgets import QApplication, QDesktopWidget
-from PySide2.QtCore import QTimer
+try:
+    from shiboken6 import wrapInstance
+    from PySide6 import QtWidgets, QtCore, QtGui
+    from PySide6.QtWidgets import QApplication
+    from PySide6.QtCore import QTimer
+except ImportError:
+    # Qt related imports
+    from shiboken2 import wrapInstance
+    from PySide2 import QtWidgets, QtCore, QtGui
+    from PySide2.QtWidgets import QApplication, QDesktopWidget
+    from PySide2.QtCore import QTimer
 
 # Standard library imports
 import os
@@ -253,13 +259,36 @@ class toolbar(object):
 
 
         # Utility for determining screen resolution
-        desktop = QDesktopWidget()
-        screen_resolution = desktop.screenGeometry()
-        self.screen_width = screen_resolution.width()
+        screen_width, screen_height = self.get_screen_resolution()
+        self.screen_width = screen_width
+        #print(f"Screen width: {self.screen_width}")
 
 
         # Attempt to load customGraph
         QTimer.singleShot(6000, self.load_customGraph_try_01)
+
+
+
+
+    def get_screen_resolution(self):
+        app = QApplication.instance()
+        if not app:
+            app = QApplication([])
+
+        try:
+            # PySide2
+            from PySide2.QtGui import QDesktopWidget
+            desktop = QDesktopWidget()
+            screen_rect = desktop.screenGeometry()
+        except ImportError:
+            # PySide6
+            screen = app.primaryScreen()
+            screen_rect = screen.geometry()
+
+        screen_width = screen_rect.width()
+        screen_height = screen_rect.height()
+        
+        return screen_width, screen_height
 
 
 
@@ -1593,7 +1622,8 @@ class toolbar(object):
                     members = cmds.sets(sub_sel_set, q=True)
 
                     # Crea una cadena con los nombres de los miembros separados por comas
-                    members_string = ", ".join(members)
+                    members_string = ", ".join(m for m in (members or []) if cmds.objExists(m))
+
                     
 
                     # El botón selecciona los miembros del conjunto de selección al hacer clic en él
@@ -1875,52 +1905,110 @@ class toolbar(object):
 
 
 
+
     def adjust_keyframes(self):
+
+        def _as_scalar(value):
+            v = value
+            while isinstance(v, (list, tuple)) and len(v) == 1:
+                v = v[0]
+            if isinstance(v, (list, tuple)):
+                return None, False
+            return v, True
 
         global animation_offset_original_values
 
-        # Obtener el rango de tiempo seleccionado en el Range Slider
+        # Range del Time Slider
         aTimeSlider = mel.eval('$tmpVar=$gPlayBackSlider')
         timeRange = cmds.timeControl(aTimeSlider, q=True, rangeArray=True)
-
-        # Si no se selecciona un rango, utilizar todo el rango de la línea de tiempo
         if timeRange[1] - timeRange[0] == 1:
-            timeRange = [cmds.playbackOptions(q=True, minTime=True), cmds.playbackOptions(q=True, maxTime=True)]
+            timeRange = [
+                cmds.playbackOptions(q=True, minTime=True),
+                cmds.playbackOptions(q=True, maxTime=True),
+            ]
 
         selected_objects = cmds.ls(selection=True)
 
         for obj in selected_objects:
-            attrs = cmds.listAttr(obj, keyable=True)
-            if attrs:
-                for attr in attrs:
-                    attr_full_name = obj + '.' + attr
-                    if cmds.getAttr(attr_full_name, settable=True):
-                        keyframes = cmds.keyframe(obj, attribute=attr, query=True)
-                        if keyframes:
-                            for frame in keyframes:
-                                if timeRange[0] <= frame <= timeRange[1]:
-                                    current_value = cmds.getAttr(attr_full_name, time=frame)
-                                    original_value = self.animation_offset_original_values[obj][attr].get(frame)
-                                    if original_value is not None:  # Ensure the original value was stored
-                                        diff = current_value - original_value
-                                        if diff != 0:
-                                            for frame_to_update in keyframes:
-                                                if timeRange[0] <= frame_to_update <= timeRange[1]:
-                                                    original_value_to_update = self.animation_offset_original_values[obj][attr].get(frame_to_update)
-                                                    if original_value_to_update is not None:  # Ensure the original value was stored
-                                                        cmds.setKeyframe(obj, attribute=attr, time=frame_to_update, value=original_value_to_update + diff)
+            # SOLO escalares para evitar double3
+            attrs = cmds.listAttr(obj, keyable=True, scalar=True) or []
+            for attr in attrs:
+                attr_full_name = obj + '.' + attr
+
+                # salta bloqueados/no seteables y tipos no numéricos
+                if not cmds.getAttr(attr_full_name, settable=True) or cmds.getAttr(attr_full_name, lock=True):
+                    continue
+                a_type = cmds.getAttr(attr_full_name, type=True)
+                if a_type in ('enum', 'string', 'message'):
+                    continue
+
+                keyframes = cmds.keyframe(obj, attribute=attr, query=True)
+                if not keyframes:
+                    continue
+
+                for frame in keyframes:
+                    if not (timeRange[0] <= frame <= timeRange[1]):
+                        continue
+
+                    # valores actual y original
+                    cur_raw = cmds.getAttr(attr_full_name, time=frame)
+                    current_value, ok_cur = _as_scalar(cur_raw)
+
+                    original_value = (
+                        self.animation_offset_original_values
+                        .get(obj, {})
+                        .get(attr, {})
+                        .get(frame)
+                    )
+
+                    if original_value is not None:
+                        original_value, ok_org = _as_scalar(original_value)
+                    else:
+                        ok_org = False
+
+                    if not (ok_cur and ok_org):
+                        # si alguno no es escalar, ignora este par (evita restar listas)
+                        continue
+
+                    diff = current_value - original_value
+                    if diff == 0:
+                        continue
+
+                    # aplica offset a todas las keys del rango (UNA sola vez por atributo)
+                    for frame_to_update in keyframes:
+                        if not (timeRange[0] <= frame_to_update <= timeRange[1]):
+                            continue
+
+                        orig_update = (
+                            self.animation_offset_original_values
+                            .get(obj, {})
+                            .get(attr, {})
+                            .get(frame_to_update)
+                        )
+                        if orig_update is None:
+                            continue
+
+                        orig_update, ok_upd = _as_scalar(orig_update)
+                        if not ok_upd:
+                            continue
+
+                        new_val = orig_update + diff
+                        cmds.setKeyframe(obj, attribute=attr, time=frame_to_update, value=new_val)
 
 
+                    for fr in keyframes:
+                        if timeRange[0] <= fr <= timeRange[1]:
+                            self.animation_offset_original_values.setdefault(obj, {}).setdefault(attr, {})[fr] = cmds.getAttr(attr_full_name, time=fr)
 
+
+                    break  # salimos del bucle de frames (ya aplicamos el offset para este attr)
 
 
     def offset_animation_deferred(self, interval):
-
         def adjust_offset_animation():
-
             self.adjust_keyframes()
 
-        while self.anim_offset_run_timer: 
+        while self.anim_offset_run_timer:
             time.sleep(interval)
             utils.executeDeferred(adjust_offset_animation)
 
@@ -1951,6 +2039,10 @@ class toolbar(object):
                 self.anim_offset_run_timer = False
                 pass
 
+
+
+
+#---------------------------------------------------------------
 
     def toggle_micro_move_button(self, *args):
 
@@ -2015,9 +2107,14 @@ class toolbar(object):
                 # Calcula los pixeles que sobran si quitamos al ancho total de la vista el tamaño de la toolbar
                 sobrante = workspace_width - user_preferences.toolbar_size
 
-                desktop = QDesktopWidget()
-                screen_resolution = desktop.screenGeometry()
-                screen_width = screen_resolution.width()
+
+                screen_width, screen_height = self.get_screen_resolution()
+                self.screen_width = screen_width
+
+                #Obsoleto
+                #desktop = QDesktopWidget()
+                #screen_resolution = desktop.screenGeometry()
+                #screen_width = screen_resolution.width()
 
                 if screen_width == 3840:
                     margen = sobrante / 5
@@ -2166,6 +2263,235 @@ class toolbar(object):
     def maya_main_window(self, *args):
         main_window_ptr = mui.MQtUtil.mainWindow()
         return wrapInstance(int(main_window_ptr), QtWidgets.QWidget)
+
+
+
+
+
+
+    # ___________________________________________ iBookmarks _____________________________________________________________ #
+
+
+    def create_ibookmark_node(self, *args):
+        if not cmds.objExists("TheKeyMachine"):
+            general.create_TheKeyMachine_node()
+        if not cmds.objExists("iBookmarks"):
+            general.create_ibookmarks_node()
+
+            
+
+    def create_bookmark(self, list_widget, *args):
+        current_selection = cmds.ls(selection=True)
+        if not current_selection:
+            cmds.warning("No objects selected.")
+            return
+
+        text = cmds.promptDialog(
+            title='Create Bookmark',
+            message='Enter bookmark name:',
+            button=['Create', 'Cancel'],
+            defaultButton='Create',
+            cancelButton='Cancel',
+            dismissString='Cancel'
+        )
+
+        if text == 'Create':
+            bookmark_name = cmds.promptDialog(query=True, text=True)
+            if not bookmark_name:  # Validar si el campo de texto está vacío
+                cmds.warning("Bookmark name cannot be empty.")
+                return
+
+            # Validar el nombre del bookmark usando una expresión regular
+            if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", bookmark_name):
+                cmds.warning("Invalid bookmark name. It should start with a letter or underscore and contain only letters, numbers, and underscores.")
+                return
+
+            self.create_ibookmark_node()
+            bookmark_node = cmds.group(em=True, name=f"{bookmark_name}_ibookmark")
+            cmds.parent(bookmark_node, "iBookmarks")
+
+            new_groups = []  # Lista para almacenar los nuevos grupos
+
+            for obj in current_selection:
+                # Obtener el nombre del objeto sin la ruta (si existe)
+                obj_name = obj.split('|')[-1]
+                
+                # Si el nombre del objeto contiene "->", eliminar la parte anterior a esos caracteres
+                if "->" in obj_name:
+                    obj_name = obj_name.split("->")[-1]
+
+                # Eliminar cualquier punto en el nombre del objeto (para imagePlanes)
+                obj_name = obj_name.replace('.', '_')  
+                new_group = cmds.group(em=True, name=f"{obj_name}_{bookmark_name}_ibook")
+                cmds.parent(new_group, bookmark_node)
+                new_groups.append(new_group)  # Agregar el nuevo grupo a la lista
+
+            # Desemparentar los objetos después de crear todos los grupos
+            for new_group in new_groups:
+                cmds.select(new_group, add=True)
+
+            self.update_bookmark_list(list_widget)
+        cmds.select(clear=True)
+        self.update_popup_menu()
+
+
+
+
+    def remove_bookmark(self, list_widget, *args):
+        item = cmds.textScrollList(list_widget, query=True, selectItem=True)
+        if item:
+            text = item[0]
+            bookmark_node = f"{text}_ibookmark"
+            cmds.delete(bookmark_node)  # Eliminar el nodo del bookmark
+            self.update_bookmark_list(list_widget)
+            self.update_popup_menu()
+
+
+
+    def isolate_bookmark(self, list_widget=None, bookmark_name=None, *args):
+        current_selection = cmds.ls(selection=True, long=True)  # Obtén los nombres completos de los objetos seleccionados
+
+        # Si bookmark_name no es proporcionado, obténlo del list_widget
+        if not bookmark_name and list_widget:
+            item = cmds.textScrollList(list_widget, query=True, selectItem=True)
+            if item:
+                bookmark_name = item[0]
+
+        if bookmark_name:
+            # Remover '_ibookmark' del final del nombre para obtener el nombre del bookmark
+            bookmark_name = bookmark_name.replace('_ibookmark', '')
+            # Encontrar el nodo del bookmark
+            bookmark_node = f"{bookmark_name}_ibookmark"
+            if cmds.objExists(bookmark_node):
+                # Obtener todos los objetos dentro del nodo de bookmark
+                objects = cmds.listRelatives(bookmark_node, allDescendents=True, fullPath=True)  # Usa fullPath=True aquí
+                if objects:
+                    selected_objects = []
+                    for obj in objects:
+                        # Remover "_ibook" del final del nombre del objeto
+                        obj_name = obj.rsplit('|', 1)[-1].replace('_ibook', '')
+                        # Remover el sufijo que coincide con el texto de la lista de bookmarks
+                        obj_name = obj_name.replace(f'_{bookmark_name}', '')
+                        
+                        # Asegúrate de que el objeto exista antes de agregarlo a la lista de objetos seleccionados
+                        if cmds.objExists(obj_name):
+                            selected_objects.append(obj_name)
+
+                    # Obtener el estado actual del aislamiento
+                    currentPanel = cmds.getPanel(wf=True)
+                    panelType = cmds.getPanel(typeOf=currentPanel)
+                    if panelType == "modelPanel":
+                        currentState = cmds.isolateSelect(currentPanel, query=True, state=True)
+                        cmds.select(selected_objects)
+                        # If the isolation is not active, we activate it and add the selection
+                        if currentState == 0:
+                            cmds.isolateSelect(currentPanel, state=1)
+                            cmds.isolateSelect(currentPanel, addSelected=True)
+                        else:
+                            # Si el aislamiento está activo, vaciamos la selección actual y añadimos la nueva selección
+                            cmds.isolateSelect(currentPanel, state=0)
+                            cmds.isolateSelect(currentPanel, state=1)
+                            cmds.isolateSelect(currentPanel, addSelected=True)
+
+                    else:
+                        cmds.warning("Please set the focus on a camera or viewport.")
+
+
+                else:
+                    cmds.warning(f"No hay objetos dentro del bookmark '{bookmark_name}'.")
+            else:
+                cmds.warning(f"Bookmark '{bookmark_name}' no encontrado en la escena.")
+        else:
+            cmds.warning("No bookmark selected.")
+
+        # Restaurar la selección original al final de la función
+        cmds.select(clear=True)
+        if current_selection:
+            cmds.select(current_selection)
+
+
+
+
+
+    def update_bookmark_list(self, list_widget, *args):
+        bookmarks = cmds.listRelatives("iBookmarks", children=True) or []
+        cmds.textScrollList(list_widget, edit=True, removeAll=True)  # Limpiar la lista
+        for bookmark in bookmarks:
+            text = bookmark.replace('_ibookmark', '')
+            cmds.textScrollList(list_widget, edit=True, append=text)
+
+
+    def create_ibookmarks_window(self, *args):
+
+        original_selection = cmds.ls(selection=True)
+
+        if cmds.window("iBookmarksWindow", exists=True):
+            cmds.deleteUI("iBookmarksWindow")
+
+        window = cmds.window("iBookmarksWindow", title="Isolate Bookmarks", widthHeight=(265, 140), sizeable=False)  # Hacer la ventana no redimensionable
+        main_layout = cmds.columnLayout(adjustableColumn=True, rowSpacing=10, columnAlign="center")
+
+        # Crear un formLayout para controlar la disposición de los elementos
+        form_layout = cmds.formLayout()
+        
+        # Columna de la izquierda con la lista
+        list_widget = cmds.textScrollList(allowMultiSelection=False, h=130)
+        
+        # Columna de la derecha con los botones
+        button_layout = cmds.columnLayout(adjustableColumn=True, columnAlign="center")
+        create_button = cmds.button(label="Create", command=lambda x: self.create_bookmark(list_widget), width=90)  # Ajustar el ancho del botón
+        remove_button = cmds.button(label="Remove", command=lambda x: self.remove_bookmark(list_widget), width=90)  # Ajustar el ancho del botón
+        isolate_button = cmds.button(label="Isolate", command=lambda x: self.isolate_bookmark(list_widget), width=90)  # Ajustar el ancho del botón
+        
+        # Establecer las restricciones de disposición en el formLayout
+        cmds.formLayout(form_layout, edit=True,
+                        attachForm=[(list_widget, 'left', 5), (list_widget, 'top', 5),
+                                    (button_layout, 'top', 5), (button_layout, 'right', 5)],
+                        attachControl=[(list_widget, 'right', 5, button_layout)])
+        
+        cmds.setParent(main_layout)  # Regresar al layout principal
+        cmds.showWindow(window)
+        self.create_ibookmark_node()
+        self.update_bookmark_list(list_widget)
+
+        # Restaurar la selección original
+        if original_selection:
+            cmds.select(original_selection, replace=True)
+        else:
+            cmds.select(clear=True)
+
+
+
+
+    def update_popup_menu(self, *args):
+
+        if not cmds.objExists("iBookmarks"):
+            return
+
+        # Obtén todos los nombres de los bookmarks existentes
+        bookmarks = cmds.listRelatives("iBookmarks", children=True) or []
+
+        # Limpia el menú popup actual
+        cmds.popupMenu(self.isolate_button_popupMenu, e=True, deleteAllItems=True)
+
+        # Agrega un ítem por cada bookmark existente
+        for bookmark in bookmarks:
+            text = bookmark.replace('_ibookmark', '')
+            cmds.menuItem(l=text, parent=self.isolate_button_popupMenu, image=media.grey_menu_image, c=lambda x, text=text: self.isolate_bookmark(bookmark_name=text))
+
+
+        cmds.menuItem(divider=True, parent=self.isolate_button_popupMenu)
+
+        # Agrega un ítem para abrir la ventana de bookmarks
+        cmds.menuItem(l="Bookmarks", c=lambda x: self.create_ibookmarks_window(), annotation="Open isolate bookmarks window", image=media.ibookmarks_menu_image, parent=self.isolate_button_popupMenu)
+        cmds.menuItem(divider=True, parent=self.isolate_button_popupMenu)
+        cmds.menuItem('down_level_checkbox', l="Down one level", annotation="", checkBox=False, c=lambda x: bar.toggle_down_one_level(x), parent=self.isolate_button_popupMenu)
+
+
+
+
+
+
 
 
 
@@ -2616,6 +2942,59 @@ class toolbar(object):
 
 
 
+
+
+
+        def blend_to_default_wrapper(value):
+
+            selected_objects = cmds.ls(selection=True, long=True)
+            if not selected_objects:
+                return
+
+            json_file_path = keyTools.general.get_set_default_data_file()
+
+            # Leer datos guardados si existen
+            if os.path.exists(json_file_path):
+                with open(json_file_path, 'r') as file:
+                    data = json.load(file)
+            else:
+                data = {}
+
+            for obj in selected_objects:
+                attrs = cmds.listAttr(obj, keyable=True)
+                if not attrs:
+                    continue
+
+                for attr in attrs:
+                    try:
+                        attr_full = f"{obj}.{attr}"
+                        namespace = obj.split(':')[0] if ':' in obj else 'default'
+
+                        # Obtener valor actual
+                        current_value = cmds.getAttr(attr_full)
+
+                        # Obtener valor por defecto desde JSON o Maya
+                        if namespace in data and attr_full in data[namespace]:
+                            default_value = data[namespace][attr_full]
+                        else:
+                            default_query = cmds.attributeQuery(attr, node=obj, listDefault=True)
+                            default_value = default_query[0] if default_query else current_value
+
+                        # Interpolar entre el valor actual y el valor por defecto
+                        new_value = (1 - value) * current_value + value * default_value
+
+                        # Aplicar nuevo valor suavizado
+                        cmds.setAttr(attr_full, new_value)
+
+                    except Exception as e:
+                        print(f"Error blending {attr} on {obj}: {str(e)}")
+
+            update_blend_label_with_slider_value(value)
+
+
+
+
+
         def blend_slider_wrapper(value):
             keyTools.handle_autokey_start()
             keyTools.blend_to_key(value)  # Llama a la función tween original
@@ -2627,8 +3006,10 @@ class toolbar(object):
             label = "BL"
             if current_blend_slider_mode == 'pull_push':
                 label = "PP"
-            elif current_blend_slider_mode == 'blend_to_frame':
+            if current_blend_slider_mode == 'blend_to_frame':
                 label = "BK"
+            if current_blend_slider_mode == 'blend_to_default':
+                label = "BD"
             cmds.text('barBlendSliderLabelText', edit=True, label=label)
             # Llama a la función tweenSliderReset
             keyTools.handle_autokey_end()
@@ -2648,23 +3029,34 @@ class toolbar(object):
             current_blend_slider_mode = mode
             cmds.floatSlider("bar_blend_slider", edit=True, value=0)  # Restablecer el slider
             if mode == 'pull_push':
-                cmds.floatSlider("bar_blend_slider", edit=True, dragCommand=pull_push_wrapper)  # Divide el valor por 10 antes de pasarlo
+                cmds.floatSlider("bar_blend_slider", edit=True, min=-50, max=50, value=0, dragCommand=pull_push_wrapper)  # Divide el valor por 10 antes de pasarlo
                 cmds.text('barBlendSliderLabelText', edit=True, label="PP" )
                 
                 cmds.button('blend_to_key_left', edit=True, vis=False, w=1, h=1)
                 cmds.button('blend_to_key_right', edit=True, vis=False, w=1, h=1)
                 cmds.separator('blend_to_key_right_button_separator', edit=True, w=1)
                 cmds.separator('blend_to_key_left_button_separator', edit=True, w=1)
+            
             elif mode == 'blend':
-                cmds.floatSlider("bar_blend_slider", edit=True, dragCommand=blend_slider_wrapper)
+                cmds.floatSlider("bar_blend_slider", edit=True, min=-50, max=50, value=0, dragCommand=blend_slider_wrapper)
                 cmds.text('barBlendSliderLabelText', edit=True, label="BL" )
                 
                 cmds.button('blend_to_key_left', edit=True, vis=False, w=1, h=1)
                 cmds.button('blend_to_key_right', edit=True, vis=False, w=1, h=1)
                 cmds.separator('blend_to_key_right_button_separator', edit=True, w=1)
                 cmds.separator('blend_to_key_left_button_separator', edit=True, w=1)
+            
+            elif mode == 'blend_to_default':
+                cmds.floatSlider("bar_blend_slider", edit=True, min=0, max=1, value=0, dragCommand=blend_to_default_wrapper)
+                cmds.text('barBlendSliderLabelText', edit=True, label="BD" )
+                
+                cmds.button('blend_to_key_left', edit=True, vis=False, w=1, h=1)
+                cmds.button('blend_to_key_right', edit=True, vis=False, w=1, h=1)
+                cmds.separator('blend_to_key_right_button_separator', edit=True, w=1)
+                cmds.separator('blend_to_key_left_button_separator', edit=True, w=1)
+            
             elif mode == 'blend_to_frame':
-                cmds.floatSlider("bar_blend_slider", edit=True, dragCommand=blend_to_frame_wrapper)
+                cmds.floatSlider("bar_blend_slider", edit=True, min=-50, max=50, value=0, dragCommand=blend_to_frame_wrapper)
                 cmds.text('barBlendSliderLabelText', edit=True, label="BK" )
                 
                 cmds.button('blend_to_key_left', edit=True, vis=True, w=25, h=16)
@@ -2753,6 +3145,7 @@ class toolbar(object):
         
         # Agrega los items de menú con radio buttons
         bar_blend_blend_menu = cmds.menuItem(l="Blend", radioButton=True, p=barBlendSlider_popup_menu, command=lambda x: set_blend_slider_command('blend'))
+        bar_blend_default_menu = cmds.menuItem(l="Blend to Default", radioButton=True, p=barBlendSlider_popup_menu, command=lambda x: set_blend_slider_command('blend_to_default'))
         bar_blend_blend_to_key_menu = cmds.menuItem(l="Blend to Frame", radioButton=True, p=barBlendSlider_popup_menu, command=lambda x: set_blend_slider_command('blend_to_frame'))
         bar_blend_pull_push_menu = cmds.menuItem(l="Pull / Push", radioButton=True, p=barBlendSlider_popup_menu, command=lambda x: set_blend_slider_command('pull_push'))
 
@@ -3055,229 +3448,6 @@ class toolbar(object):
         cmds.separator("bar_tween_slider_separator", style='none', width=10, p="rowtoolbar")
 
 
-        # ___________________________________________ iBookmarks _____________________________________________________________ #
-
-
-        def create_ibookmark_node(*args):
-            if not cmds.objExists("TheKeyMachine"):
-                general.create_TheKeyMachine_node()
-            if not cmds.objExists("iBookmarks"):
-                general.create_ibookmarks_node()
-
-                
-
-        def create_bookmark(list_widget, *args):
-            current_selection = cmds.ls(selection=True)
-            if not current_selection:
-                cmds.warning("No objects selected.")
-                return
-
-            text = cmds.promptDialog(
-                title='Create Bookmark',
-                message='Enter bookmark name:',
-                button=['Create', 'Cancel'],
-                defaultButton='Create',
-                cancelButton='Cancel',
-                dismissString='Cancel'
-            )
-
-            if text == 'Create':
-                bookmark_name = cmds.promptDialog(query=True, text=True)
-                if not bookmark_name:  # Validar si el campo de texto está vacío
-                    cmds.warning("Bookmark name cannot be empty.")
-                    return
-
-                # Validar el nombre del bookmark usando una expresión regular
-                if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", bookmark_name):
-                    cmds.warning("Invalid bookmark name. It should start with a letter or underscore and contain only letters, numbers, and underscores.")
-                    return
-
-                create_ibookmark_node()
-                bookmark_node = cmds.group(em=True, name=f"{bookmark_name}_ibookmark")
-                cmds.parent(bookmark_node, "iBookmarks")
-
-                new_groups = []  # Lista para almacenar los nuevos grupos
-
-                for obj in current_selection:
-                    # Obtener el nombre del objeto sin la ruta (si existe)
-                    obj_name = obj.split('|')[-1]
-                    
-                    # Si el nombre del objeto contiene "->", eliminar la parte anterior a esos caracteres
-                    if "->" in obj_name:
-                        obj_name = obj_name.split("->")[-1]
-
-                    # Eliminar cualquier punto en el nombre del objeto (para imagePlanes)
-                    obj_name = obj_name.replace('.', '_')  
-                    new_group = cmds.group(em=True, name=f"{obj_name}_{bookmark_name}_ibook")
-                    cmds.parent(new_group, bookmark_node)
-                    new_groups.append(new_group)  # Agregar el nuevo grupo a la lista
-
-                # Desemparentar los objetos después de crear todos los grupos
-                for new_group in new_groups:
-                    cmds.select(new_group, add=True)
-
-                update_bookmark_list(list_widget)
-            cmds.select(clear=True)
-            update_popup_menu()
-
-
-
-
-        def remove_bookmark(list_widget, *args):
-            item = cmds.textScrollList(list_widget, query=True, selectItem=True)
-            if item:
-                text = item[0]
-                bookmark_node = f"{text}_ibookmark"
-                cmds.delete(bookmark_node)  # Eliminar el nodo del bookmark
-                update_bookmark_list(list_widget)
-                update_popup_menu()
-
-
-
-        def isolate_bookmark(list_widget=None, bookmark_name=None, *args):
-            current_selection = cmds.ls(selection=True, long=True)  # Obtén los nombres completos de los objetos seleccionados
-
-            # Si bookmark_name no es proporcionado, obténlo del list_widget
-            if not bookmark_name and list_widget:
-                item = cmds.textScrollList(list_widget, query=True, selectItem=True)
-                if item:
-                    bookmark_name = item[0]
-
-            if bookmark_name:
-                # Remover '_ibookmark' del final del nombre para obtener el nombre del bookmark
-                bookmark_name = bookmark_name.replace('_ibookmark', '')
-                # Encontrar el nodo del bookmark
-                bookmark_node = f"{bookmark_name}_ibookmark"
-                if cmds.objExists(bookmark_node):
-                    # Obtener todos los objetos dentro del nodo de bookmark
-                    objects = cmds.listRelatives(bookmark_node, allDescendents=True, fullPath=True)  # Usa fullPath=True aquí
-                    if objects:
-                        selected_objects = []
-                        for obj in objects:
-                            # Remover "_ibook" del final del nombre del objeto
-                            obj_name = obj.rsplit('|', 1)[-1].replace('_ibook', '')
-                            # Remover el sufijo que coincide con el texto de la lista de bookmarks
-                            obj_name = obj_name.replace(f'_{bookmark_name}', '')
-                            
-                            # Asegúrate de que el objeto exista antes de agregarlo a la lista de objetos seleccionados
-                            if cmds.objExists(obj_name):
-                                selected_objects.append(obj_name)
-
-                        # Obtener el estado actual del aislamiento
-                        currentPanel = cmds.getPanel(wf=True)
-                        panelType = cmds.getPanel(typeOf=currentPanel)
-                        if panelType == "modelPanel":
-                            currentState = cmds.isolateSelect(currentPanel, query=True, state=True)
-                            cmds.select(selected_objects)
-                            # If the isolation is not active, we activate it and add the selection
-                            if currentState == 0:
-                                cmds.isolateSelect(currentPanel, state=1)
-                                cmds.isolateSelect(currentPanel, addSelected=True)
-                            else:
-                                # Si el aislamiento está activo, vaciamos la selección actual y añadimos la nueva selección
-                                cmds.isolateSelect(currentPanel, state=0)
-                                cmds.isolateSelect(currentPanel, state=1)
-                                cmds.isolateSelect(currentPanel, addSelected=True)
-
-                        else:
-                            cmds.warning("Please set the focus on a camera or viewport.")
-
-
-                    else:
-                        cmds.warning(f"No hay objetos dentro del bookmark '{bookmark_name}'.")
-                else:
-                    cmds.warning(f"Bookmark '{bookmark_name}' no encontrado en la escena.")
-            else:
-                cmds.warning("No bookmark selected.")
-
-            # Restaurar la selección original al final de la función
-            cmds.select(clear=True)
-            if current_selection:
-                cmds.select(current_selection)
-
-
-
-
-
-        def update_bookmark_list(list_widget, *args):
-            bookmarks = cmds.listRelatives("iBookmarks", children=True) or []
-            cmds.textScrollList(list_widget, edit=True, removeAll=True)  # Limpiar la lista
-            for bookmark in bookmarks:
-                text = bookmark.replace('_ibookmark', '')
-                cmds.textScrollList(list_widget, edit=True, append=text)
-
-
-        def create_ibookmarks_window(*args):
-
-            original_selection = cmds.ls(selection=True)
-
-            if cmds.window("iBookmarksWindow", exists=True):
-                cmds.deleteUI("iBookmarksWindow")
-
-            window = cmds.window("iBookmarksWindow", title="Isolate Bookmarks", widthHeight=(265, 140), sizeable=False)  # Hacer la ventana no redimensionable
-            main_layout = cmds.columnLayout(adjustableColumn=True, rowSpacing=10, columnAlign="center")
-
-            # Crear un formLayout para controlar la disposición de los elementos
-            form_layout = cmds.formLayout()
-            
-            # Columna de la izquierda con la lista
-            list_widget = cmds.textScrollList(allowMultiSelection=False, h=130)
-            
-            # Columna de la derecha con los botones
-            button_layout = cmds.columnLayout(adjustableColumn=True, columnAlign="center")
-            create_button = cmds.button(label="Create", command=lambda x: create_bookmark(list_widget), width=90)  # Ajustar el ancho del botón
-            remove_button = cmds.button(label="Remove", command=lambda x: remove_bookmark(list_widget), width=90)  # Ajustar el ancho del botón
-            isolate_button = cmds.button(label="Isolate", command=lambda x: isolate_bookmark(list_widget), width=90)  # Ajustar el ancho del botón
-            
-            # Establecer las restricciones de disposición en el formLayout
-            cmds.formLayout(form_layout, edit=True,
-                            attachForm=[(list_widget, 'left', 5), (list_widget, 'top', 5),
-                                        (button_layout, 'top', 5), (button_layout, 'right', 5)],
-                            attachControl=[(list_widget, 'right', 5, button_layout)])
-            
-            cmds.setParent(main_layout)  # Regresar al layout principal
-            cmds.showWindow(window)
-            create_ibookmark_node()
-            update_bookmark_list(list_widget)
-
-            # Restaurar la selección original
-            if original_selection:
-                cmds.select(original_selection, replace=True)
-            else:
-                cmds.select(clear=True)
-
-
-
-
-        def update_popup_menu(*args):
-
-            if not cmds.objExists("iBookmarks"):
-                return
-
-            # Obtén todos los nombres de los bookmarks existentes
-            bookmarks = cmds.listRelatives("iBookmarks", children=True) or []
-
-            # Limpia el menú popup actual
-            cmds.popupMenu(isolate_button_popupMenu, e=True, deleteAllItems=True)
-
-            # Agrega un ítem por cada bookmark existente
-            for bookmark in bookmarks:
-                text = bookmark.replace('_ibookmark', '')
-                cmds.menuItem(
-                    l=text, 
-                    parent=isolate_button_popupMenu,
-                    image=media.grey_menu_image,
-                    c=lambda x, text=text: isolate_bookmark(bookmark_name=text)
-    )
-
-
-            cmds.menuItem(divider=True, parent=isolate_button_popupMenu)
-
-            # Agrega un ítem para abrir la ventana de bookmarks
-            cmds.menuItem(l="Bookmarks", c=lambda x: create_ibookmarks_window(), annotation="Open isolate bookmarks window", image=media.ibookmarks_menu_image, parent=isolate_button_popupMenu)
-            cmds.menuItem(divider=True, parent=isolate_button_popupMenu)
-            cmds.menuItem('down_level_checkbox', l="Down one level", annotation="", checkBox=False, c=lambda x: bar.toggle_down_one_level(x), parent=isolate_button_popupMenu)
-
 
 
 
@@ -3324,15 +3494,15 @@ class toolbar(object):
         isolate_button_widget = wrapInstance(int(mui.MQtUtil.findControl(isolate_button)), QtWidgets.QWidget)
         isolate_button_widget.setToolTip("")
 
-        isolate_button_popupMenu = cmds.popupMenu('isolate_button_popupMenu', button=3, ctl=False, alt=False, parent=isolate_button)
-        cmds.menuItem(l="Bookmarks", c=lambda x: create_ibookmarks_window(), image=media.ibookmarks_menu_image, parent=isolate_button_popupMenu)
-        cmds.menuItem(divider=True, parent=isolate_button_popupMenu)
-        cmds.menuItem('down_level_checkbox', l="Down one level", checkBox=False, c=lambda x: bar.toggle_down_one_level(x), parent=isolate_button_popupMenu)
-        cmds.menuItem(divider=True, parent=isolate_button_popupMenu)
-        cmds.menuItem(l="Help",  c=lambda x: general.open_url("https://thekeymachine.gitbook.io/base/the-toolbar/animation-tools/isolate"), image=media.help_menu_image, parent=isolate_button_popupMenu)
+        self.isolate_button_popupMenu = cmds.popupMenu('isolate_button_popupMenu', button=3, ctl=False, alt=False, parent=isolate_button)
+        cmds.menuItem(l="Bookmarks", c=lambda x: self.create_ibookmarks_window(), image=media.ibookmarks_menu_image, parent=self.isolate_button_popupMenu)
+        cmds.menuItem(divider=True, parent=self.isolate_button_popupMenu)
+        cmds.menuItem('down_level_checkbox', l="Down one level", checkBox=False, c=lambda x: bar.toggle_down_one_level(x), parent=self.isolate_button_popupMenu)
+        cmds.menuItem(divider=True, parent=self.isolate_button_popupMenu)
+        cmds.menuItem(l="Help",  c=lambda x: general.open_url("https://thekeymachine.gitbook.io/base/the-toolbar/animation-tools/isolate"), image=media.help_menu_image, parent=self.isolate_button_popupMenu)
 
 
-        isolate_menu_style_widget = wrapInstance(int(mui.MQtUtil.findControl(isolate_button_popupMenu)), QtWidgets.QWidget)
+        isolate_menu_style_widget = wrapInstance(int(mui.MQtUtil.findControl(self.isolate_button_popupMenu)), QtWidgets.QWidget)
         isolate_menu_style_widget.setStyleSheet(f'''
             QMenu {{
                 background-color: {style.QMenu_bg_color};
@@ -3347,7 +3517,7 @@ class toolbar(object):
 
 
         # Esta linea hay que meterla en el scriptJOb de cuando se abre una escena nueva
-        update_popup_menu()
+        self.update_popup_menu()
 
 
 
@@ -3552,6 +3722,7 @@ class toolbar(object):
         cmds.menuItem(l="Paste Animation", c=keyTools.paste_animation, image=media.paste_animation_image, p=copy_paste_animation_popup_menu)
         cmds.menuItem(l="Paste Insert", c=keyTools.paste_insert_animation, image=media.paste_insert_animation_image, p=copy_paste_animation_popup_menu)
         cmds.menuItem(l="Paste Opposite", c=keyTools.paste_opposite_animation, image=media.paste_opposite_animation_image, p=copy_paste_animation_popup_menu)
+        cmds.menuItem(l="Paste To", c=lambda *_: keyTools.paste_animation_to(), image=media.paste_animation_image, p=copy_paste_animation_popup_menu)
         cmds.menuItem(divider=True, parent=copy_paste_animation_popup_menu)
         cmds.menuItem(l="Copy Pose", c=keyTools.copy_pose, image=media.copy_pose_image, p=copy_paste_animation_popup_menu)
         cmds.menuItem(l="Paste Pose", c=keyTools.paste_pose, image=media.paste_pose_image, p=copy_paste_animation_popup_menu)

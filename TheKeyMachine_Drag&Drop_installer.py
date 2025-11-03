@@ -102,7 +102,7 @@ def install(button, checkbox, tkm_version, window):
         else:
             msg_box = QtWidgets.QMessageBox()
             msg_box.setWindowTitle("Installation Warning")
-            msg_box.setText("TheKeyMachine folder already exists in the scripts directory. Please remove it before proceeding with the installation.")
+            msg_box.setText(f"TheKeyMachine folder already exists in the scripts directory: {destination_dir} .Please remove it before proceeding with the installation.")
             msg_box.setIcon(QtWidgets.QMessageBox.Warning)
             ok_button = msg_box.addButton('OK', QtWidgets.QMessageBox.AcceptRole)
             ok_button.setMinimumHeight(30)
